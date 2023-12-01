@@ -3,6 +3,7 @@ from multicamera_acquisition.video_io_ffmpeg import write_frame
 from multicamera_acquisition.paths import ensure_dir
 from multicamera_acquisition.interfaces.arduino import (
     packIntAsLong,
+    unpackIntAsLong,
     wait_for_serial_confirmation,
 )
 from multicamera_acquisition.visualization import MultiDisplay
@@ -502,14 +503,16 @@ def acquire_video(
             ),
         )
     )
+
+    # Start the recording!!
     arduino.write(msg)
 
-    # Run acquision
+    # Wait for confirmation from the arduino
     try:
         confirmation = wait_for_serial_confirmation(
             arduino, expected_confirmation="Start", seconds_to_wait=10
         )
-    except:
+    except ValueError:
         # kill everything if we can't get confirmation
         end_processes(acquisition_loops, writers, disp)
         return save_location
@@ -517,33 +520,44 @@ def acquire_video(
     if verbose:
         logging.log(logging.INFO, f"Starting Acquisition...")
 
+    # Monitor the recording
     try:
-        # while current time is less than initial time + recording_duration_s
         pbar = tqdm(total=recording_duration_s, desc="recording progress (s)")
-        # how long to record
         datetime_prev = datetime.now()
-        endtime = datetime_prev + timedelta(seconds=recording_duration_s + 10)
+        endtime = datetime_prev + timedelta(seconds=recording_duration_s + 10)  # how long to record
         while datetime.now() < endtime:
-            confirmation = arduino.readline().decode("utf-8").strip("\r\n")
-            if len(confirmation) > 0:
-                print(confirmation)
-            if confirmation == "Finished":
+
+            ### Handle arduino output ###
+            # Get first char from the arduino, this indicates what the message will be
+            # "@": indicates message is about a pin state change
+            # "F": indicates message is "Finished"
+            first_char = arduino.read().decode("utf-8")
+            if first_char == "@":
+                current_millis = unpackIntAsLong(arduino.read(4))
+                current_cycle = unpackIntAsLong(arduino.read(4))
+                pins = [int(byte) for byte in arduino.read(4)]  # assumes 4 GPIO pins
+                arduino.readline()  # remove newline chars from buffer
+                msg = ','.join([str(current_millis), str(current_cycle)] + [str(pin) for pin in pins])
+                if verbose:
+                    # print(f"Trigger change: {msg}")
+                    logging.log(logging.INFO, f"Arduino: {msg}")
+                with open(triggerdata_file, "a") as triggerdata_f:
+                    triggerdata_writer = csv.writer(triggerdata_f)
+                    triggerdata_writer.writerow([current_millis, current_cycle] + pins)
+            else:
+                # Read the rest of the message
+                rest_of_msg = arduino.readline().decode("utf-8").strip("\r\n")
+                msg = first_char + rest_of_msg
+                print(msg)
+
+            # Break if done
+            if msg == "Finished":
                 break
+
+            # Update progress bar
             if (datetime.now() - datetime_prev).seconds > 0:
                 pbar.update((datetime.now() - datetime_prev).seconds)
                 datetime_prev = datetime.now()
-            # save input data flags
-            if len(confirmation) > 0:
-                # print(confirmation)
-                if confirmation[:7] == "input: ":
-                    with open(triggerdata_file, "a") as triggerdata_f:
-                        triggerdata_writer = csv.writer(triggerdata_f)
-                        states = confirmation[7:].split(",")[:-2]
-                        frame_num = confirmation[7:].split(",")[-2]
-                        arduino_clock = confirmation[7:].split(",")[-1]
-                        triggerdata_writer.writerow([frame_num, arduino_clock] + states)
-                if verbose:
-                    logging.log(logging.INFO, f"confirmation")
 
         # wait for a confirmation of being finished
         if confirmation == "Finished":
